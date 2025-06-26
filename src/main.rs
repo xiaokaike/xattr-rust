@@ -1,67 +1,78 @@
+use std::env;
 use std::fs;
-use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use xattr;
 
-fn set_folder_icon(folder_path: &str, icon_path: &str) -> std::io::Result<()> {
-    let folder = Path::new(folder_path);
+/// 文件夹中隐藏图标文件的真实名称：Icon\r（Icon 加一个回车）
+fn icon_file_path(folder: &Path) -> PathBuf {
+    let mut p = folder.to_path_buf();
+    p.push("Icon\r"); // 真实文件名包含回车
+    p
+}
 
-    // Step 1: 创建 Icon\r 文件，写入图标数据
-    let icon_file_path: PathBuf = folder.join("Icon\r");
-    let icon_data = fs::read(icon_path)?;
-    let mut icon_file = File::create(&icon_file_path)?;
-    icon_file.write_all(&icon_data)?;
-
-    // Step 2: 获取并修改 com.apple.FinderInfo 属性（32字节）
-    let mut finder_info = match xattr::get(folder, "com.apple.FinderInfo") {
-        Ok(Some(data)) if data.len() == 32 => {
-            let mut buf = [0u8; 32];
-            buf.copy_from_slice(&data);
-            buf
-        }
-        _ => [0u8; 32], // 新建空 FinderInfo
+/// 设置 FinderInfo 的 HasCustomIcon 标志位（第 9 字节为 0x10）
+fn set_has_custom_icon_flag(folder: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut data = match xattr::get(folder, "com.apple.FinderInfo")? {
+        Some(d) if d.len() == 32 => d,
+        _ => vec![0u8; 32],
     };
 
-    finder_info[8] |= 0x04; // 第10字节，第3位为 HasCustomIcon
-    println!("{:?}", finder_info);
-    xattr::set(folder, "com.apple.FinderInfo", &finder_info)?;
+    data[8] |= 0x10; // 设置 HasCustomIcon 位
+    xattr::set(folder, "com.apple.FinderInfo", &data)?;
+    Ok(())
+}
 
-    // Step 3: 隐藏 Icon\r 文件
-    Command::new("chflags")
-        .arg("hidden")
-        .arg(icon_file_path.to_str().unwrap())
+/// 拷贝 icns 图标为 Icon\r，并设置隐藏属性（需要安装 Xcode Command Line Tools）
+fn copy_icon_and_hide(icns_path: &Path, folder: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let icon_dest = icon_file_path(folder);
+
+    // 拷贝 icns 内容
+    fs::copy(icns_path, &icon_dest)?;
+
+    // 使用 macOS 的 SetFile 命令设置为隐藏（必须有 Xcode CLT）
+    let status = std::process::Command::new("SetFile")
+        .arg("-a")
+        .arg("V")
+        .arg(&icon_dest)
         .status()?;
 
-    // Step 4: 通知 Finder 更新显示
-    Command::new("osascript")
-        .arg("-e")
-        .arg(format!(
-            "tell application \"Finder\" to update POSIX file \"{}\"",
-            folder.display()
-        ))
-        .status()?;
+    if !status.success() {
+        eprintln!("⚠️ SetFile 设置隐藏失败。你可能没有安装 Xcode Command Line Tools");
+    }
 
     Ok(())
 }
-fn main() {
-    let data = xattr::get("/Users/donke/Test/bbbb", "com.apple.FinderInfo");
-    match data {
-        Ok(Some(data)) => {
-            println!("{:?}", data);
-        }
-        _ => {
-            println!("没有找到 FinderInfo 属性");
-        }
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 参数：folder_path icon_file.icns
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 3 {
+        println!("用法: {} <folder_path> <icon_file.icns>", args[0]);
+        std::process::exit(1);
     }
 
-    let folder = "/Users/donke/Test/ddd3";
-    let icon = "/Users/donke/Test/icon.icns";
-    match set_folder_icon(folder, icon) {
-        Ok(_) => println!("图标设置成功"),
-        Err(e) => eprintln!("设置失败: {}", e),
+    let folder_path = Path::new(&args[1]);
+    let icns_path = Path::new(&args[2]);
+
+    if !folder_path.is_dir() {
+        return Err(format!("❌ 文件夹不存在: {}", folder_path.display()).into());
+    }
+    if !icns_path.exists() {
+        return Err(format!("❌ 图标文件不存在: {}", icns_path.display()).into());
     }
 
+    copy_icon_and_hide(icns_path, folder_path)?;
+    set_has_custom_icon_flag(folder_path)?;
 
+    println!("✅ 设置成功！");
+    println!("📦 文件夹: {}", folder_path.display());
+    println!("📎 图标文件: {}", icns_path.display());
+    println!("\n📌 如果 Finder 图标未更新，请运行：");
+    println!(
+        "osascript -e 'tell application \"Finder\" to update POSIX file \"{}\"'",
+        folder_path.display()
+    );
+
+    Ok(())
 }
