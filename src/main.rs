@@ -1,78 +1,73 @@
 use std::env;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use xattr;
 
-/// 文件夹中隐藏图标文件的真实名称：Icon\r（Icon 加一个回车）
+/// 获取 Icon^M 的路径（Icon 后跟 \r）
 fn icon_file_path(folder: &Path) -> PathBuf {
     let mut p = folder.to_path_buf();
-    p.push("Icon\r"); // 真实文件名包含回车
+    p.push("Icon\r");
     p
 }
 
-/// 设置 FinderInfo 的 HasCustomIcon 标志位（第 9 字节为 0x10）
-fn set_has_custom_icon_flag(folder: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let mut data = match xattr::get(folder, "com.apple.FinderInfo")? {
-        Some(d) if d.len() == 32 => d,
-        _ => vec![0u8; 32],
-    };
-
-    data[8] |= 0x10; // 设置 HasCustomIcon 位
-    xattr::set(folder, "com.apple.FinderInfo", &data)?;
-    Ok(())
-}
-
-/// 拷贝 icns 图标为 Icon\r，并设置隐藏属性（需要安装 Xcode Command Line Tools）
-fn copy_icon_and_hide(icns_path: &Path, folder: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let icon_dest = icon_file_path(folder);
-
-    // 拷贝 icns 内容
-    fs::copy(icns_path, &icon_dest)?;
-
-    // 使用 macOS 的 SetFile 命令设置为隐藏（必须有 Xcode CLT）
-    let status = std::process::Command::new("SetFile")
-        .arg("-a")
-        .arg("V")
-        .arg(&icon_dest)
-        .status()?;
-
+fn run(cmd: &str, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+    let status = Command::new(cmd).args(args).status()?;
     if !status.success() {
-        eprintln!("⚠️ SetFile 设置隐藏失败。你可能没有安装 Xcode Command Line Tools");
+        Err(format!("❌ 命令执行失败: {} {:?}", cmd, args).into())
+    } else {
+        Ok(())
     }
-
-    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 参数：folder_path icon_file.icns
     let args: Vec<String> = env::args().collect();
     if args.len() != 3 {
-        println!("用法: {} <folder_path> <icon_file.icns>", args[0]);
+        eprintln!("用法: {} <FOLDER_PATH> <ICON_FILE>", args[0]);
         std::process::exit(1);
     }
 
-    let folder_path = Path::new(&args[1]);
-    let icns_path = Path::new(&args[2]);
+    let folder = Path::new(&args[1]);
+    let icon = Path::new(&args[2]);
 
-    if !folder_path.is_dir() {
-        return Err(format!("❌ 文件夹不存在: {}", folder_path.display()).into());
+    if !folder.is_dir() {
+        return Err(format!("❌ 文件夹不存在: {}", folder.display()).into());
     }
-    if !icns_path.exists() {
-        return Err(format!("❌ 图标文件不存在: {}", icns_path.display()).into());
+    if !icon.exists() {
+        return Err(format!("❌ 图标文件不存在: {}", icon.display()).into());
     }
 
-    copy_icon_and_hide(icns_path, folder_path)?;
-    set_has_custom_icon_flag(folder_path)?;
+    // === 步骤 1: sips -i 图标，写入资源分支
+    run("sips", &["-i", icon.to_str().unwrap()])?;
 
-    println!("✅ 设置成功！");
-    println!("📦 文件夹: {}", folder_path.display());
-    println!("📎 图标文件: {}", icns_path.display());
-    println!("\n📌 如果 Finder 图标未更新，请运行：");
-    println!(
-        "osascript -e 'tell application \"Finder\" to update POSIX file \"{}\"'",
-        folder_path.display()
+    // === 步骤 2: DeRez 提取 icns 为 rsrc
+    let rsrc_path = "/tmp/icon.rsrc";
+    // run("DeRez", &["-only", "icns", icon.to_str().unwrap(), ">", rsrc_path])?;
+    // ⚠️ 注意：上面这行 > 并不会生效，因为 `>` 是 shell 功能。我们需要使用 shell 包装：
+
+    let rsrc_command = format!(
+        "DeRez -only icns {} > {}",
+        icon.to_str().unwrap(),
+        rsrc_path
     );
+    run("sh", &["-c", &rsrc_command])?;
+
+    // === 步骤 3: 创建 Icon\r 文件
+    let icon_file = icon_file_path(folder);
+    fs::write(&icon_file, &[])?; // 相当于 touch
+
+    // === 步骤 4: 注入 rsrc 到 Icon\r
+    run("Rez", &["-append", rsrc_path, "-o", icon_file.to_str().unwrap()])?;
+
+    // === 步骤 5: 设置 Icon\r 为隐藏
+    run("SetFile", &["-a", "V", icon_file.to_str().unwrap()])?;
+
+    // === 步骤 6: 设置 com.apple.FinderInfo，标志使用自定义图标
+    let finder_info_hex = "0000000000000000040000000000000000000000000000000000000000000000";
+    let finder_info_bytes = hex::decode(finder_info_hex)?;
+    xattr::set(folder, "com.apple.FinderInfo", &finder_info_bytes)?;
+
+    println!("✅ 文件夹图标设置完成：{}", folder.display());
 
     Ok(())
 }
