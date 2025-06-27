@@ -1,73 +1,99 @@
-use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::Path;
 use xattr;
+use byteorder::{BigEndian, WriteBytesExt};
+use std::io::Error;
+use icns::{IconFamily, Image};
 
-/// 获取 Icon^M 的路径（Icon 后跟 \r）
-fn icon_file_path(folder: &Path) -> PathBuf {
-    let mut p = folder.to_path_buf();
-    p.push("Icon\r");
-    p
+// A reverse-engineered implementation of the macos
+// Icon\r resource fork binary format
+pub fn encode(icns: &Vec<u8>) -> Result<Vec<u8>, Error> {
+  let mut rsrc = Vec::new();
+  let icon_size = icns.len() as u32;
+
+  let mut header = [0; 65];
+  header[0] = 0x100;
+  header[1] = icon_size + 0x104;
+  header[2] = icon_size + 0x4;
+  header[3] = 0x32;
+  header[64] = icon_size;
+
+  for &n in &header {
+    rsrc.write_u32::<BigEndian>(n)?;
+  }
+  for &n in icns {
+    rsrc.write_u8(n)?;
+  }
+  for &n in &vec![
+    0x00000100,
+    icon_size + 0x104,
+    icon_size + 0x4,
+    0x00000032,
+    0x00000000,
+    0x00000000,
+    0x001C0032,
+    0x00006963,
+    0x6E730000,
+    0x000ABFB9,
+    0xFFFF0000,
+    0x00000000,
+    0x00000000,
+  ] {
+    rsrc.write_u32::<BigEndian>(n)?;
+  }
+
+  Ok(rsrc)
 }
 
-fn run(cmd: &str, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
-    let status = Command::new(cmd).args(args).status()?;
-    if !status.success() {
-        Err(format!("❌ 命令执行失败: {} {:?}", cmd, args).into())
-    } else {
-        Ok(())
-    }
+
+// 写入 Icon\r 并隐藏
+fn write_icon_file(folder: &Path, icns_data: &[u8]) -> std::io::Result<()> {
+    let icon_path = folder.join("Icon\r");
+    fs::write(&icon_path, icns_data)?;
+    std::process::Command::new("chflags")
+        .arg("hidden")
+        .arg(&icon_path)
+        .status()
+        .ok();
+    Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    if args.len() != 3 {
-        eprintln!("用法: {} <FOLDER_PATH> <ICON_FILE>", args[0]);
-        std::process::exit(1);
-    }
+/// 设置 FinderInfo 的 kHasCustomIcon 标志（用 xattr crate）
+fn set_finder_info_flag(folder: &Path) -> std::io::Result<()> {
+    let attr_name = "com.apple.FinderInfo";
 
-    let folder = Path::new(&args[1]);
-    let icon = Path::new(&args[2]);
-
-    if !folder.is_dir() {
-        return Err(format!("❌ 文件夹不存在: {}", folder.display()).into());
-    }
-    if !icon.exists() {
-        return Err(format!("❌ 图标文件不存在: {}", icon.display()).into());
-    }
-
-    // === 步骤 1: sips -i 图标，写入资源分支
-    run("sips", &["-i", icon.to_str().unwrap()])?;
-
-    // === 步骤 2: DeRez 提取 icns 为 rsrc
-    let rsrc_path = "/tmp/icon.rsrc";
-    // run("DeRez", &["-only", "icns", icon.to_str().unwrap(), ">", rsrc_path])?;
-    // ⚠️ 注意：上面这行 > 并不会生效，因为 `>` 是 shell 功能。我们需要使用 shell 包装：
-
-    let rsrc_command = format!(
-        "DeRez -only icns {} > {}",
-        icon.to_str().unwrap(),
-        rsrc_path
-    );
-    run("sh", &["-c", &rsrc_command])?;
-
-    // === 步骤 3: 创建 Icon\r 文件
-    let icon_file = icon_file_path(folder);
-    fs::write(&icon_file, &[])?; // 相当于 touch
-
-    // === 步骤 4: 注入 rsrc 到 Icon\r
-    run("Rez", &["-append", rsrc_path, "-o", icon_file.to_str().unwrap()])?;
-
-    // === 步骤 5: 设置 Icon\r 为隐藏
-    run("SetFile", &["-a", "V", icon_file.to_str().unwrap()])?;
-
-    // === 步骤 6: 设置 com.apple.FinderInfo，标志使用自定义图标
     let finder_info_hex = "0000000000000000040000000000000000000000000000000000000000000000";
-    let finder_info_bytes = hex::decode(finder_info_hex)?;
-    xattr::set(folder, "com.apple.FinderInfo", &finder_info_bytes)?;
+    let finder_info_bytes = hex::decode(finder_info_hex)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    xattr::set(folder, attr_name, &finder_info_bytes)?;
 
-    println!("✅ 文件夹图标设置完成：{}", folder.display());
+    Ok(())
+}
 
+/// 纯 Rust：设置文件夹图标
+pub fn set_custom_folder_icon(folder: &Path, icns_data: &[u8]) -> std::io::Result<()> {
+    write_icon_file(folder, icns_data)?;
+    set_finder_info_flag(folder)?;
+    Ok(())
+}
+
+fn main() -> std::io::Result<()> {
+    let folder = Path::new("/Users/donke/Test/ddd1");
+    // let png_bytes = include_bytes!("/Users/donke/Test/sync-folder-icon.png");
+    // let mut icon_family = IconFamily::new();
+
+    // icon_family.add_icon(&image.try_into()?)?;
+
+    // let mut icns: Vec<u8> = Vec::new();
+    // icon_family.write(&mut icns)?;
+
+
+    let icns_data_bytes = include_bytes!("/Users/donke/Test/sync-folder-icon.icns");
+    // let icns_data = std::fs::read("/Users/donke/Test/sync-folder-icon.png")?;
+    let icns_data = icns_data_bytes.to_vec();
+    let rsrc = encode(&icns_data).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    set_custom_folder_icon(folder, &rsrc)?;
+    println!("✅ 设置成功！");
     Ok(())
 }

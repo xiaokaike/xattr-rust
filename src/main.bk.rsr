@@ -1,0 +1,123 @@
+use std::env;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use xattr;
+use std::io::{Read, Write};
+
+const FINDER_INFO_ATTR: &str = "com.apple.FinderInfo";
+
+/// 获取 Icon^M 的路径（Icon 后跟 \r）
+fn icon_file_path(folder: &Path) -> PathBuf {
+    let mut p = folder.to_path_buf();
+    p.push("Icon\r");
+    p
+}
+
+fn run(cmd: &str, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+    let status = Command::new(cmd).args(args).status()?;
+    if !status.success() {
+        Err(format!("❌ 命令执行失败: {} {:?}", cmd, args).into())
+    } else {
+        Ok(())
+    }
+}
+
+fn append_rsrc_to_icon(tmp_rsrc_path: &Path, icon_output_path: &Path) -> std::io::Result<()> {
+    let mut rsrc = fs::File::open(tmp_rsrc_path)?;
+    let mut icon = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(icon_output_path)?;
+
+    let mut buf = Vec::new();
+    rsrc.read_to_end(&mut buf)?;
+    icon.write_all(&buf)?;
+
+    Ok(())
+}
+
+
+fn set_finder_icon() -> Result<(), Box<dyn std::error::Error>> {
+let args: Vec<String> = env::args().collect();
+    if args.len() != 3 {
+        eprintln!("用法: {} <FOLDER_PATH> <ICON_FILE>", args[0]);
+        std::process::exit(1);
+    }
+
+    let folder = Path::new(&args[1]);
+
+    if !folder.is_dir() {
+        return Err(format!("❌ 文件夹不存在: {}", folder.display()).into());
+    }
+
+
+    let png_icns_data = include_bytes!("/Users/donke/Test/sync-folder-icon.png");
+    let rsrc_data = include_bytes!("/Users/donke/Test/fn-sync-folder-icon.rsrc");
+    let icns_bytes = include_bytes!("/Users/donke/Test/icon.icns");
+
+    // println!("正在设置文件夹图标: {} {} {}", png_icns_data.len(), rsrc_data.len(), icns_bytes.len());
+
+    // === 步骤 3: 创建 Icon\r 文件
+    // let icon_file = icon_file_path(folder);
+    // fs::write(&icon_file, icns_data)?; // 相当于 touch
+
+    // // === 步骤 5: 设置 Icon\r 为隐藏
+    // Command::new("chflags")
+    //     .arg("hidden")
+    //     .arg(&icon_file)
+    //     .status()
+    //     .ok();
+
+    // let rsrc_path = Path::new("/Users/donke/Test/fn-sync-folder-icon.rsrc");
+    // let icon_output_path = Path::new(folder).join("Icon\r");
+    // let _ = append_rsrc_to_icon(rsrc_path, icon_output_path.as_path());
+
+
+    let icon_path = folder.join("Icon\r");
+
+    fs::write(&icon_path, icns_bytes)?;
+
+    Command::new("chflags")
+        .arg("hidden")
+        .arg(&icon_path)
+        .status()
+        .ok();
+
+    // === 步骤 6: 设置 com.apple.FinderInfo，标志使用自定义图标
+    let finder_info_hex = "0000000000000000040000000000000000000000000000000000000000000000";
+    let finder_info_bytes = hex::decode(finder_info_hex)?;
+    xattr::set(folder, FINDER_INFO_ATTR, &finder_info_bytes)?;
+
+    println!("✅ 文件夹图标设置完成：{}", folder.display());
+
+    Ok(())
+}
+
+
+// fn set_2() {
+//     fs::copy("/Users/donke/Test/icon_tmp", "/Users/donke/Test/ddd4/Icon\r")?;
+//     let folder = Path::new("/Users/donke/Test/ddd4");
+//     let finder_info_hex = "0000000000000000040000000000000000000000000000000000000000000000";
+//     let finder_info_bytes = hex::decode(finder_info_hex)?;
+//     xattr::set(folder, FINDER_INFO_ATTR, &finder_info_bytes)?;
+// }
+
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+
+    let bytes = include_bytes!("/Users/donke/Test/icon_tmp");
+
+    println!("bytes len: {}", bytes.len());
+
+    let mut file = File::create("/Users/donke/Test/forder_temp")?;
+    file.write_all(bytes)?;
+
+    // Command::new("chflags")
+    //     .arg("visible")
+    //     .arg("/Users/donke/Test/icon_tmp")
+    //     .status()
+    //     .ok();
+
+    Ok(())
+}
